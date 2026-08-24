@@ -1,0 +1,7 @@
+.env
+logs/
+__pycache__/
+*.pyc
+candles_backtest.json
+trading_state*.json
+governance_state.json
