@@ -15,6 +15,7 @@ from performance import PerformanceMetrics
 class GovernanceParams:
     stop_loss_pct: float = 0.05
     take_profit_pct: float = 0.03
+    trailing_stop_pct: float = 0.02
     sell_fraction_pct: float = 0.3
     max_position_size_pct: float = 0.3
     rsi_overbought: float = 70.0
@@ -69,7 +70,9 @@ class GovernorAgent:
     def should_reflect(
         self, state: GovernanceState, total_trades: int, now: float
     ) -> bool:
-        if self.llm_provider == "none" or not self.llm_api_key:
+        # rules governor needs no LLM; only a misconfigured LLM (provider set,
+        # key missing) must stay quiet
+        if self.llm_provider != "none" and not self.llm_api_key:
             return False
         trades_since = total_trades - (state.consecutive_losses_at_last_reflection if state.reflection_count > 0 else 0)
         time_since = now - state.last_reflection_time
@@ -86,16 +89,30 @@ class GovernorAgent:
         recent_trades_summary: str,
         market_summary: str,
     ) -> GovernanceParams:
+        if self.llm_provider == "none" or not self.llm_api_key:
+            return self._reflect_rules(state, metrics, current_params)
+
         prompt = self._build_reflection_prompt(
             metrics, current_params, recent_trades_summary, market_summary
         )
-
         new_params = await self._call_llm(prompt)
         new_params.governor_notes = new_params.governor_notes or "No changes proposed"
         new_params = self._clamp_params(new_params)
+        self._record_reflection(state, metrics, current_params, new_params)
+        return new_params
 
+    def _record_reflection(
+        self,
+        state: GovernanceState,
+        metrics: PerformanceMetrics,
+        current_params: GovernanceParams,
+        new_params: GovernanceParams,
+    ) -> None:
         state.last_reflection_time = time.time()
         state.reflection_count += 1
+        # trade-count baseline for should_reflect: without this the trades-since
+        # trigger stays true on every scan once the threshold is first crossed
+        state.consecutive_losses_at_last_reflection = metrics.total_trades
         state.reflection_history.append({
             "time": datetime.now(tz=timezone.utc).isoformat(),
             "metrics": {
@@ -108,11 +125,54 @@ class GovernorAgent:
             "new_params": asdict(new_params),
         })
 
-        return new_params
+    def _reflect_rules(
+        self,
+        state: GovernanceState,
+        metrics: PerformanceMetrics,
+        current_params: GovernanceParams,
+    ) -> GovernanceParams:
+        """Governor without the LLM: reflexes only, no insight. Tightens risk
+        after losing streaks or deep drawdowns; never loosens on wins (that
+        would be betting a no-edge stretch continues), and never spams the
+        decision log when it hits the safety floor."""
+        if metrics.total_trades < 3:
+            state.last_reflection_time = time.time()  # heartbeat; nothing to judge yet
+            return current_params
+
+        tighten, notes = False, []
+        if metrics.consecutive_losses >= 3:
+            tighten = True
+            notes.append(f"{metrics.consecutive_losses} consecutive losses")
+        if metrics.total_trades >= 6 and metrics.win_rate < 0.35 and metrics.total_pnl < 0:
+            tighten = True
+            notes.append(f"{metrics.win_rate * 100:.0f}% win rate on net losses")
+        if metrics.current_drawdown_pct > 10:
+            tighten = True
+            notes.append(f"drawdown {metrics.current_drawdown_pct:.1f}%")
+
+        if not tighten:
+            state.last_reflection_time = time.time()
+            return current_params
+
+        p = GovernanceParams(**asdict(current_params))
+        p.stop_loss_pct = max(0.01, p.stop_loss_pct * 0.85)
+        p.max_position_size_pct = max(0.05, p.max_position_size_pct * 0.8)
+        p.max_daily_trades = max(1, p.max_daily_trades - 1)
+        clamped = self._clamp_params(p)
+
+        stripped = lambda d: {k: v for k, v in d.items() if k != "governor_notes"}
+        if stripped(asdict(clamped)) == stripped(asdict(current_params)):
+            state.last_reflection_time = time.time()  # at safety floor: no-op
+            return current_params
+
+        clamped.governor_notes = "Rules governor tightened: " + "; ".join(notes)
+        self._record_reflection(state, metrics, current_params, clamped)
+        return clamped
 
     def _clamp_params(self, p: GovernanceParams) -> GovernanceParams:
         p.stop_loss_pct = max(0.01, min(0.20, p.stop_loss_pct))
         p.take_profit_pct = max(0.005, min(0.15, p.take_profit_pct))
+        p.trailing_stop_pct = max(0.005, min(0.10, p.trailing_stop_pct))
         p.sell_fraction_pct = max(0.05, min(0.8, p.sell_fraction_pct))
         p.max_position_size_pct = max(0.05, min(0.9, p.max_position_size_pct))
         p.rsi_overbought = max(60, min(90, p.rsi_overbought))
@@ -133,6 +193,7 @@ Your job is to review recent performance and market conditions, then propose str
 === CURRENT PARAMETERS ===
 - Stop loss: {params.stop_loss_pct*100:.1f}%
 - Take profit: {params.take_profit_pct*100:.1f}%
+- Trailing stop: {params.trailing_stop_pct*100:.1f}% (ratchets on open-position peak price)
 - Sell fraction (portion of position trimmed per exit): {params.sell_fraction_pct*100:.1f}%
 - Max position size: {params.max_position_size_pct*100:.1f}%
 - RSI overbought: {params.rsi_overbought}
@@ -165,6 +226,7 @@ Include a brief "governor_notes" explaining your reasoning.
 {{
   "stop_loss_pct": 0.05,
   "take_profit_pct": 0.03,
+  "trailing_stop_pct": 0.02,
   "sell_fraction_pct": 0.3,
   "max_position_size_pct": 0.3,
   "rsi_overbought": 70.0,
@@ -236,6 +298,7 @@ Include a brief "governor_notes" explaining your reasoning.
             return GovernanceParams(
                 stop_loss_pct=float(result.get("stop_loss_pct", 0.05)),
                 take_profit_pct=float(result.get("take_profit_pct", 0.03)),
+                trailing_stop_pct=float(result.get("trailing_stop_pct", 0.02)),
                 sell_fraction_pct=float(result.get("sell_fraction_pct", 0.3)),
                 max_position_size_pct=float(result.get("max_position_size_pct", 0.3)),
                 rsi_overbought=float(result.get("rsi_overbought", 70.0)),
@@ -246,3 +309,58 @@ Include a brief "governor_notes" explaining your reasoning.
             )
         except (json.JSONDecodeError, KeyError, ValueError):
             return GovernanceParams(governor_notes=f"Parse error: {content[:100]}")
+
+
+def demo() -> None:
+    """Rules-governor behaviour on synthetic metrics (no LLM, no network)."""
+    import asyncio
+
+    g = GovernorAgent()  # provider "none" -> rules governor
+    st = GovernanceState()
+
+    # rules mode: should_reflect fires on the time interval, no API key needed
+    assert g.should_reflect(st, 0, st.last_reflection_time + 3601)
+
+    # too few trades: heartbeat only, no params change, no history entry
+    m0 = PerformanceMetrics()
+    out = asyncio.run(g.reflect(st, m0, GovernanceParams(), "", ""))
+    assert out == GovernanceParams()
+    assert st.reflection_count == 0
+    assert st.last_reflection_time > 0  # heartbeat set, else we'd loop every scan
+
+    # losing streak -> tightens stop, size, and daily cap; logs the decision
+    m1 = PerformanceMetrics(total_trades=5, win_rate=0.2,
+                            total_pnl=Decimal("-100"), consecutive_losses=3)
+    gp = GovernanceParams(stop_loss_pct=0.05, max_position_size_pct=0.3,
+                          max_daily_trades=5)
+    out = asyncio.run(g.reflect(st, m1, gp, "", ""))
+    assert out.stop_loss_pct < gp.stop_loss_pct
+    assert out.max_position_size_pct < gp.max_position_size_pct
+    assert out.max_daily_trades == 4
+    assert out.governor_notes.startswith("Rules governor")
+    assert st.reflection_count == 1 and st.reflection_history
+
+    # afterwards the trades-since trigger is quiet until more trades accrue
+    assert not g.should_reflect(st, 5, time.time())
+
+    # at the safety floor: no change, no spam history entry
+    floored = GovernanceParams(stop_loss_pct=0.01, max_position_size_pct=0.05,
+                               max_daily_trades=1)
+    out2 = asyncio.run(g.reflect(st, m1, floored, "", ""))
+    assert out2 == floored and st.reflection_count == 1
+
+    # healthy record: no change, no history
+    m2 = PerformanceMetrics(total_trades=10, win_rate=0.6,
+                            total_pnl=Decimal("200"), consecutive_losses=0)
+    out3 = asyncio.run(g.reflect(st, m2, GovernanceParams(), "", ""))
+    assert out3 == GovernanceParams() and st.reflection_count == 1
+
+    # LLM configured but keyless: never fires (misconfiguration guard)
+    assert not GovernorAgent(llm_provider="openai").should_reflect(
+        GovernanceState(), 0, time.time())
+
+    print("governance demo OK")
+
+
+if __name__ == "__main__":
+    demo()

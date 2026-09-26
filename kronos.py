@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -8,6 +9,8 @@ from typing import Any
 import httpx
 
 from client import Candle
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -54,9 +57,16 @@ class KronosClient:
             resp = self._client.post(f"{self.base_url}/predict", json=payload)
             resp.raise_for_status()
             closes = _extract_predicted_closes(resp.json())
-        except Exception:
+        except Exception as e:
+            # degrade gracefully, but never silently — an outage that
+            # vanishes from the score with no log line is undebuggable
+            logger.warning("Kronos forecast failed (%s): %s", self.base_url, e)
             return None
         if not closes:
+            logger.warning(
+                "Kronos responded 200 but no 'close' fields parsed from /predict: %s",
+                self.base_url,
+            )
             return None
 
         current = Decimal(str(lookback[-1].close))

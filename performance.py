@@ -87,10 +87,22 @@ def compute_metrics(
         float(gross_profit) if gross_profit > 0 else 0.0
     )
 
-    avg_r = sum(returns) / len(returns)
-    variance = sum((r - avg_r) ** 2 for r in returns) / len(returns)
-    std_dev = math.sqrt(variance) if variance > 0 else 1.0
-    m.sharpe_ratio = (avg_r / std_dev) * math.sqrt(365) if std_dev > 0 else 0.0
+    # returns here are PER TRADE, not daily. Annualising them with sqrt(365)
+    # reported Sharpe 12.18 for a strategy making ~1 trade/yr; the honest
+    # figure is ~0.6. Annualise by the trade rate the sample actually shows.
+    if len(returns) < 2:
+        m.sharpe_ratio = 0.0
+    else:
+        avg_r = sum(returns) / len(returns)
+        variance = sum((r - avg_r) ** 2 for r in returns) / len(returns)
+        std_dev = math.sqrt(variance) if variance > 0 else 1.0
+        span_ms = max(t["exit_time"] for t in completed_trades) - min(
+            t["entry_time"] for t in completed_trades)
+        span_years = span_ms / (365.25 * 24 * 3600 * 1000)
+        per_year = len(returns) / span_years if span_years > 0 else 1.0
+        m.sharpe_ratio = (avg_r / std_dev) * math.sqrt(per_year) if std_dev > 0 else 0.0
+        # ponytail: no confidence interval. 5 trades can't establish a Sharpe;
+        # treat it as a sanity check on dispersion, not a risk-adjusted return.
 
     peak = float(peak_value)
     current = float(current_value)

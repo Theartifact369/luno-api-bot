@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,13 +39,14 @@ class CompletedTrade:
     pnl_pct: Decimal
     holding_period_seconds: int
     exit_reason: str = "signal"
+    entry_reason: str = ""  # the signal family that opened this position (decision log)
 
 
 @dataclass
 class TradeLog:
     trades: list[dict[str, Any]] = field(default_factory=list)
 
-    def add(self, order: Order) -> None:
+    def add(self, order: Order, reason: str = "") -> None:
         self.trades.append({
             "order_id": order.order_id,
             "pair": order.pair,
@@ -54,6 +58,7 @@ class TradeLog:
             "filled_at_iso": datetime.fromtimestamp(
                 order.filled_at / 1000, tz=timezone.utc
             ).isoformat(),
+            "reason": reason,
         })
 
     def save(self, path: str) -> None:
@@ -105,6 +110,8 @@ class State:
     total_fees: Decimal
     peak_portfolio_value: Decimal = Decimal("0")
     consecutive_losses: int = 0
+    vault_base: Decimal = Decimal("0")       # BTC locked from realized wins, never traded
+    vault_deposits: Decimal = Decimal("0")   # ZAR total ever swept into the vault
 
     def save(self, path: str) -> None:
         Path(path).write_text(json.dumps(asdict(self), indent=2, default=str))
@@ -137,8 +144,21 @@ class State:
                 total_fees=Decimal(str(data.get("total_fees", "0"))),
                 peak_portfolio_value=Decimal(str(data.get("peak_portfolio_value", str(base + counter)))),
                 consecutive_losses=data.get("consecutive_losses", 0),
+                vault_base=Decimal(str(data.get("vault_base", "0"))),
+                vault_deposits=Decimal(str(data.get("vault_deposits", "0"))),
             )
-        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        except FileNotFoundError:
+            return cls.initial(base, counter)
+        except (json.JSONDecodeError, KeyError) as e:
+            # corrupt state: move it aside, never silently overwrite a real
+            # account with a fresh one (the next _save_state would clobber it)
+            backup = f"{path}.corrupt"
+            Path(path).replace(backup)
+            logger.error(
+                "%s is corrupt (%s) - moved to %s, starting a fresh account. "
+                "Recover the old state from the backup before trusting this run.",
+                path, e, backup,
+            )
             return cls.initial(base, counter)
 
 
@@ -149,6 +169,7 @@ class PaperTrader:
         self.completed_log = completed_log
         self.pair = pair
         self._order_counter = 0
+        self.last_price: Decimal | None = None  # stashed by tick loop for display
 
     @property
     def portfolio_value(self) -> Decimal:
@@ -156,6 +177,22 @@ class PaperTrader:
         if self.state.open_position is not None:
             pos_value = Decimal(str(self.state.open_position.get("current_value", "0")))
         return self.state.balance_counter + pos_value
+
+    def total_value(self, price: Decimal) -> Decimal:
+        # trading capital + vault BTC marked at price
+        return self.portfolio_value + self.state.vault_base * price
+
+    def _sweep_profit_to_vault(self, zar_amount: Decimal, price: Decimal) -> Decimal:
+        # ponytail: vault = realized wins auto-converted to BTC at market, never sold.
+        # Trading capital stays at baseline; wealth compounds in sats. 0.1% Luno fee.
+        amt = min(zar_amount, self.state.balance_counter)
+        if amt <= 0:
+            return Decimal("0")
+        vol = (amt * Decimal("0.999")) / price
+        self.state.balance_counter -= amt
+        self.state.vault_base += vol
+        self.state.vault_deposits += amt
+        return vol
 
     def update_open_position_value(self, current_price: Decimal) -> None:
         if self.state.open_position is not None:
@@ -165,7 +202,8 @@ class PaperTrader:
             change = (current_price - entry) / entry
             self.state.open_position["unrealized_pnl_pct"] = str(change)
 
-    def buy(self, price: Decimal, volume: Decimal) -> Order | None:
+    def buy(self, price: Decimal, volume: Decimal, at_ms: int | None = None,
+            reason: str = "") -> Order | None:
         volume = volume.copy_abs()
         cost = price * volume
         fee = cost * Decimal("0.001")
@@ -180,13 +218,17 @@ class PaperTrader:
             total_cost = cost + fee
 
         self._order_counter += 1
+        # at_ms: the backtest replays historical candles, so the fill time must
+        # be the candle's, not wall-clock. Stamping now collapsed every backtest
+        # trade into the same instant and made holding periods read as zero.
+        fill_ms = int(time.time() * 1000) if at_ms is None else at_ms
         order = Order(
-            order_id=f"paper_{int(time.time() * 1000)}_{self._order_counter}",
+            order_id=f"paper_{fill_ms}_{self._order_counter}",
             pair=self.pair,
             side="BUY",
             price=price,
             volume=volume,
-            filled_at=int(time.time() * 1000),
+            filled_at=fill_ms,
             fee=fee,
         )
         self.state.balance_counter -= total_cost
@@ -212,13 +254,15 @@ class PaperTrader:
                 "buy_order_id": order.order_id,
                 "current_value": str(price * volume),
                 "unrealized_pnl_pct": "0",
+                "entry_reason": reason,
             }
         self.state.total_fees += fee
         self.state.total_trades += 1
-        self.trade_log.add(order)
+        self.trade_log.add(order, reason=reason)
         return order
 
-    def sell(self, price: Decimal, volume: Decimal | None = None, reason: str = "signal") -> Order | None:
+    def sell(self, price: Decimal, volume: Decimal | None = None, reason: str = "signal",
+             at_ms: int | None = None) -> Order | None:
         if self.state.open_position is None:
             return None
         if volume is None:
@@ -231,13 +275,14 @@ class PaperTrader:
         net_proceeds = proceeds - fee
 
         self._order_counter += 1
+        fill_ms = int(time.time() * 1000) if at_ms is None else at_ms
         order = Order(
-            order_id=f"paper_{int(time.time() * 1000)}_{self._order_counter}",
+            order_id=f"paper_{fill_ms}_{self._order_counter}",
             pair=self.pair,
             side="SELL",
             price=price,
             volume=volume,
-            filled_at=int(time.time() * 1000),
+            filled_at=fill_ms,
             fee=fee,
         )
 
@@ -246,11 +291,13 @@ class PaperTrader:
         buy_fee = Decimal(self.state.open_position.get("buy_fee", "0"))
         entry_time = self.state.open_position["entry_time"]
         buy_order_id = self.state.open_position.get("buy_order_id", "")
+        entry_reason = self.state.open_position.get("entry_reason", "")
 
         actual_cost = entry_price * volume
         fee_share = buy_fee * volume / pos_vol
         pnl_actual = net_proceeds - actual_cost - fee_share
-        pnl_pct = (price - entry_price) / entry_price
+        # fee-adjusted return on cost basis (was raw price return — overstated metrics)
+        pnl_pct = pnl_actual / actual_cost if actual_cost else Decimal("0")
 
         completed = CompletedTrade(
             buy_order_id=buy_order_id,
@@ -267,6 +314,7 @@ class PaperTrader:
             pnl_pct=pnl_pct,
             holding_period_seconds=int((order.filled_at - entry_time) / 1000),
             exit_reason=reason,
+            entry_reason=entry_reason,
         )
 
         was_profitable = pnl_actual > 0
@@ -285,9 +333,12 @@ class PaperTrader:
         self.state.total_trades += 1
         self.state.consecutive_losses = 0 if was_profitable else self.state.consecutive_losses + 1
 
-        current_value = self.portfolio_value
+        current_value = self.total_value(price)
         if current_value > self.state.peak_portfolio_value:
             self.state.peak_portfolio_value = current_value
+
+        if pnl_actual > 0:
+            self._sweep_profit_to_vault(pnl_actual, price)
 
         self.trade_log.add(order)
         self.completed_log.add(completed)

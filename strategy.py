@@ -23,6 +23,8 @@ class Signal:
     confidence: float
     reason: str
     price: Decimal | None = None
+    hard_exit: bool = False  # capital-preservation exits bypass the LLM
+    family: str = ""         # stable entry-signal id for the decision log
 
 
 @dataclass
@@ -61,6 +63,30 @@ class Strategy:
     def update_governance(self, params: GovernanceParams) -> None:
         self.governance = params
 
+    def _reason_feedback(self, family: str) -> tuple[float, str]:
+        """Decision-log memory: how has this ENTRY SIGNAL family performed?
+
+        Every buy stores its signal family on the position and, at exit, on the
+        completed trade. Before the next buy, that record is consulted: a family
+        that has never won (>= 2 samples) is vetoed, one that has won less than
+        half its trades gets its confidence halved. This is the 'why did we
+        think this' log feeding back — not momentary indicators, but the bot's
+        own history of reasons.
+        (ponytail: exact-family matching only. Regime repeats one stable family;
+        rules mode aggregates every rules-buy under one family. Good enough at
+        these trade rates, but per-factor families would sharpen it.)"""
+        same = [
+            Decimal(str(t["pnl_pct"])) for t in self.trader.completed_log.trades
+            if t.get("entry_reason") == family and t.get("pnl_pct") is not None
+        ]
+        if len(same) < 2:
+            return 1.0, ""
+        if all(p <= 0 for p in same):
+            return 0.0, f"family '{family}' lost {len(same)}/{len(same)}"
+        if sum(1 for p in same if p > 0) / len(same) < 0.5:
+            return 0.5, f"family '{family}' won under half ({len(same)} trades)"
+        return 1.0, ""
+
     def build_context(self, ticker: Ticker, candles: list[Candle]) -> MarketContext:
         closes = [c.close for c in candles]
         rsi = compute_rsi(closes, self.config.rsi_period)
@@ -90,6 +116,46 @@ class Strategy:
             atr=atr,
         )
 
+    def _regime_signal(
+        self, ctx: MarketContext, daily_candles: list[Candle] | None = None
+    ) -> Signal:
+        """Daily SMA50/200 regime: all-in on golden cross, cash on death cross.
+
+        VERDICT — backtest.py --sma-regime --daily, 2021-07..2026-08, 5.1yr:
+        this LOSES to buy-and-hold. +95.3% vs +130.3%. Its only edge is
+        drawdown (47% vs 73%). Sharpe is ~0.7 on 5 trades, i.e. no measurable
+        risk-adjusted edge (it printed 12.18 until the annualiser was fixed —
+        per-trade returns were being scaled by sqrt(365)). The backtest prints
+        "VERDICT: LOSES to buy-and-hold" directly under these numbers.
+
+        Shape: all-in/all-out, no trims, no SL/TP, ~1 trade per 160 days.
+        Aimed at a pair with deep history; Luno silently truncates candle
+        requests past 1000 bars from the OLD end, so keep the daily window
+        under that or the SMA goes stale with no warning.
+
+        Do not fund this until it beats holding on its own PAPER record over
+        months. Do not quote PF 5.18 / maxDD 47% without the verdict above.
+        """
+        closes = [d.close for d in daily_candles] if daily_candles else []
+        price = ctx.ticker.last_trade
+        if len(closes) < 200:
+            return Signal("HOLD", 0.0, f"Regime: warm-up ({len(closes)}/200 daily bars)", price)
+        fast = sum(closes[-50:]) / Decimal("50")
+        slow = sum(closes[-200:]) / Decimal("200")  # >= 200 bars, guard above
+        bullish = fast > slow
+        if self.trader.state.open_position is None:
+            if bullish:
+                mult, fb = self._reason_feedback("golden_cross")
+                if mult == 0:
+                    return Signal("HOLD", 0.0, f"Regime: golden cross skipped — {fb}", price)
+                reason = "Regime: SMA50>200 golden — go all-in"
+                return Signal("BUY", 0.7 * mult, reason + (f" [{fb}]" if fb else ""),
+                              price, hard_exit=True, family="golden_cross")
+            return Signal("HOLD", 0.0, "Regime: SMA50<200 — staying in cash", price)
+        if not bullish:
+            return Signal("SELL", 0.8, "Regime: SMA50<200 death cross — exit all", price, hard_exit=True)
+        return Signal("HOLD", 0.0, "Regime: bullish — holding full position", price)
+
     def _rules_signal(
         self,
         ctx: MarketContext,
@@ -100,13 +166,23 @@ class Strategy:
         gp = self.governance
 
         if self.trader.state.open_position is not None:
-            entry = Decimal(self.trader.state.open_position["entry_price"])
+            pos = self.trader.state.open_position
+            entry = Decimal(pos["entry_price"])
+            # ponytail: peak tracked at scan-tick granularity (60s) — fine for 1h candles
+            peak = Decimal(str(pos.get("peak_price", entry)))
+            if price > peak:
+                peak = price
+                pos["peak_price"] = str(price)
             change = (price - entry) / entry
 
             if change >= Decimal(str(gp.take_profit_pct)):
-                return Signal("SELL", 0.85, f"Trim take profit: +{change * 100:.2f}%", price)
+                return Signal("SELL", 0.85, f"Trim take profit: +{change * 100:.2f}%", price, hard_exit=True)
             if change <= -Decimal(str(gp.stop_loss_pct)):
-                return Signal("SELL", 0.95, f"Trim stop loss: {change * 100:.2f}%", price)
+                return Signal("SELL", 0.95, f"Trim stop loss: {change * 100:.2f}%", price, hard_exit=True)
+            if peak > entry:
+                trail = (peak - price) / peak
+                if trail >= Decimal(str(gp.trailing_stop_pct)):
+                    return Signal("SELL", 0.9, f"Trailing stop: {trail * 100:.2f}% off peak", price, hard_exit=True)
 
         score = 0.0
         reasons = []
@@ -145,7 +221,12 @@ class Strategy:
         threshold = max(0.3, 0.4 - (gp.max_position_size_pct * 0.3))
 
         if score >= threshold:
-            return Signal("BUY", min(score / 0.9, 0.9), "; ".join(reasons), price)
+            mult, fb = self._reason_feedback("rules_buy")
+            if mult == 0:
+                return Signal("HOLD", 0.0, f"Buy skipped — {fb}", price)
+            return Signal("BUY", min(score / 0.9, 0.9) * mult,
+                          "; ".join(reasons) + (f" [{fb}]" if fb else ""),
+                          price, family="rules_buy")
 
         return None
 
@@ -160,9 +241,15 @@ class Strategy:
             return None, "Kronos: forecast unavailable"
         return forecast, f"Kronos: {forecast.expected_change_pct:+.2f}% over {forecast.horizon} bars"
 
-    async def analyze(self, ctx: MarketContext) -> Signal:
+    async def analyze(self, ctx: MarketContext, daily_candles: list[Candle] | None = None) -> Signal:
+        if self.config.strategy == "regime":
+            return self._regime_signal(ctx, daily_candles)
         forecast, kronos_reason = await self._kronos_forecast(ctx)
         rules_signal = self._rules_signal(ctx, forecast, kronos_reason)
+
+        # ponytail: hard exits (SL/TP/trail) never consult the LLM
+        if rules_signal is not None and rules_signal.hard_exit:
+            return rules_signal
 
         if self.config.llm_provider != "none" and self.config.llm_api_key:
             return await self._llm_decision(ctx, rules_signal)

@@ -15,6 +15,7 @@ class RiskStatus:
     consecutive_loss_hit: bool = False
     cooldown_active: bool = False
     cooldown_until: float = 0.0
+    cooldown_just_expired: bool = False
 
 
 class RiskManager:
@@ -40,9 +41,17 @@ class RiskManager:
         self.status = RiskStatus()
 
         self._daily_start_value: Decimal | None = None
+        self._daily_date: str = ""
+        # persisted on the instance: a cooldown set once must expire on its own,
+        # not restart every scan (the old behavior blocked trading forever)
+        self._cooldown_until: float | None = None
 
-    def reset_daily(self, portfolio_value: Decimal) -> None:
-        self._daily_start_value = portfolio_value
+    def reset_daily(self, portfolio_value: Decimal, today: str) -> None:
+        # date-gated: called every scan, so an ungated reset re-zeroed the
+        # baseline each minute and the daily-loss breaker could never fire
+        if today != self._daily_date:
+            self._daily_date = today
+            self._daily_start_value = portfolio_value
 
     def check_circuit_breakers(
         self,
@@ -72,21 +81,22 @@ class RiskManager:
 
         if consecutive_losses >= self.max_consecutive_losses:
             now = datetime.now(tz=timezone.utc).timestamp()
-            if not self.status.cooldown_active:
-                self.status.cooldown_active = True
-                self.status.cooldown_until = now + float(self.cooldown_hours) * 3600
-
-            if now < self.status.cooldown_until:
-                remaining = (self.status.cooldown_until - now) / 3600
+            if self._cooldown_until is None:
+                self._cooldown_until = now + float(self.cooldown_hours) * 3600
+            if now < self._cooldown_until:
+                remaining = (self._cooldown_until - now) / 3600
                 self.status.trading_allowed = False
+                self.status.cooldown_active = True
+                self.status.cooldown_until = self._cooldown_until
                 self.status.consecutive_loss_hit = True
                 self.status.reason = (
                     f"Cooldown after {consecutive_losses} consecutive losses "
                     f"({remaining:.1f}h remaining)"
                 )
                 return self.status
-            else:
-                self.status.cooldown_active = False
+            # cooldown served: clear the counter (caller resets consecutive_losses)
+            self._cooldown_until = None
+            self.status.cooldown_just_expired = True
 
         return self.status
 

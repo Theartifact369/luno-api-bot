@@ -51,6 +51,8 @@ class Config:
     llm_api_key: str = ""
     llm_model: str = "gpt-4"
 
+    strategy: Literal["rules", "regime"] = "regime"
+
     kronos_url: str = ""
     kronos_horizon: int = 5
     kronos_refresh_seconds: int = 900
@@ -93,6 +95,7 @@ class Config:
         c.llm_provider = os.getenv("LLM_PROVIDER", c.llm_provider)
         c.llm_api_key = os.getenv("LLM_API_KEY", c.llm_api_key)
         c.llm_model = os.getenv("LLM_MODEL", c.llm_model)
+        c.strategy = os.getenv("STRATEGY", c.strategy)
         c.kronos_url = os.getenv("KRONOS_URL", c.kronos_url)
         c.kronos_horizon = int(os.getenv("KRONOS_HORIZON", str(c.kronos_horizon)))
         c.kronos_refresh_seconds = int(os.getenv("KRONOS_REFRESH_SECONDS", str(c.kronos_refresh_seconds)))

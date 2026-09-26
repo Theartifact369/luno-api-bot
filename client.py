@@ -80,7 +80,7 @@ class LunoClient:
         ]
 
     def get_recent_trades(self, pair: str, since: int | None = None) -> list[Trade]:
-        params = {"pair": pair}
+        params: dict[str, str | int | float | bool | None] = {"pair": pair}
         if since is not None:
             params["since"] = since
         resp = self._client.get("/api/1/trades", params=params)
@@ -95,6 +95,31 @@ class LunoClient:
             )
             for t in data
         ]
+
+    # account endpoints: read-only display data (returned as raw dicts,
+    # ponytail: no dataclass boilerplate for display-only payloads).
+    # `or []`: Luno returns JSON null (not []) for empty collections.
+    def get_balances(self) -> list[dict]:
+        resp = self._client.get("/api/1/balance")
+        resp.raise_for_status()
+        return resp.json().get("balance") or []
+
+    def get_pending_orders(self, pair: str) -> list[dict]:
+        resp = self._client.get(
+            "/api/1/listorders", params={"pair": pair, "state": "PENDING"}
+        )
+        resp.raise_for_status()
+        return resp.json().get("orders") or []
+
+    def get_account_trades(self, pair: str) -> list[dict]:
+        resp = self._client.get("/api/1/listtrades", params={"pair": pair})
+        resp.raise_for_status()
+        return resp.json().get("trades") or []
+
+    def get_tickers(self) -> list[dict]:
+        resp = self._client.get("/api/1/tickers")
+        resp.raise_for_status()
+        return resp.json().get("tickers") or []
 
     def close(self) -> None:
         self._client.close()

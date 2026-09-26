@@ -11,6 +11,7 @@ from pathlib import Path
 from client import Candle, LunoClient, Ticker
 from config import Config
 from governance import GovernanceParams
+from indicators import compute_rsi
 from paper_trader import CompletedTradeLog, PaperTrader, State, TradeLog
 from performance import compute_metrics
 from risk_manager import RiskManager
@@ -51,13 +52,33 @@ def fetch_candles(pair: str, duration: int, refresh: bool, config: Config) -> li
     return candles
 
 
+def resample_daily(candles: list[Candle]) -> list[Candle]:
+    days: list[Candle] = []
+    for c in candles:
+        day = c.timestamp // 86400000
+        if days and days[-1].timestamp // 86400000 == day:
+            d = days[-1]
+            d.high = max(d.high, c.high)
+            d.low = min(d.low, c.low)
+            d.close = c.close
+            d.volume += c.volume
+        else:
+            days.append(Candle(timestamp=day * 86400000, open=c.open, high=c.high,
+                               low=c.low, close=c.close, volume=c.volume))
+    return days
+
+
 def cagr_pct(start_val: Decimal, end_val: Decimal, years: float) -> float:
     if years <= 0 or start_val <= 0:
         return 0.0
     return (float(end_val / start_val) ** (1 / years) - 1) * 100
 
 
-def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend: bool = False) -> None:
+def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend: bool = False,
+                 dc_entry: int = 0, dc_exit: int = 0, dc_size: float = 0.95,
+                 sma_regime: bool = False, sma_fast: int = 50, sma_slow: int = 200,
+                 sma_break_exit: bool = False, mean_rev: bool = False,
+                 mr_oversold: int = 30, mr_exit: int = 55, mr_max_hours: int = 168) -> None:
     if len(candles) < WARMUP + 2:
         print("Not enough candle data")
         return
@@ -78,6 +99,7 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
     equity_curve: list[Decimal] = []
     last_day = ""
     prev_portfolio_value = INITIAL
+    mr_entry_i = 0
 
     for i in range(start_i, len(candles)):
         c = candles[i]
@@ -85,7 +107,7 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
         if day != last_day:
             last_day = day
             trader.reset_daily_counter(day)
-            risk.reset_daily(trader.portfolio_value)
+            risk.reset_daily(trader.total_value(c.close), day)
 
         ticker = Ticker(pair=config.trading_pair, ask=c.close, bid=c.close,
                         last_trade=c.close, timestamp=c.timestamp, status="ACTIVE")
@@ -96,11 +118,12 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
             signal = strategy._rules_signal(ctx)
 
         trader.update_open_position_value(c.close)
-        if trader.portfolio_value > trader.state.peak_portfolio_value:
-            trader.state.peak_portfolio_value = trader.portfolio_value
+        total = trader.total_value(c.close)
+        if total > trader.state.peak_portfolio_value:
+            trader.state.peak_portfolio_value = total
 
         risk_status = risk.check_circuit_breakers(
-            trader.portfolio_value,
+            total,
             trader.state.peak_portfolio_value,
             trader.state.consecutive_losses,
             trader.state.trades_today,
@@ -108,9 +131,53 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
         )
 
         if dca:
-            # weekly buy, fully deployed over the period, no signals
-            if (i - start_i) % (7 * 24) == 0:
-                trader.buy(c.close, trader.state.balance_counter / Decimal("1000"))
+            # weekly fixed-ZAR buys, fully deployed over the period, no signals
+            budget = INITIAL / Decimal(str((len(candles) - start_i) // (7 * 24)))
+            if (i - start_i) % (7 * 24) == 0 and trader.state.balance_counter >= budget:
+                trader.buy(c.close, budget / c.close, at_ms=c.timestamp)
+        elif sma_regime:
+            # Regime filter: fully invested while SMA_fast > SMA_slow, cash on
+            # death cross. Optionally exit earlier when price breaks the fast
+            # line (--sma-break-exit) to cut crash drawdowns.
+            closes = [x.close for x in candles[max(0, i - sma_slow):i + 1]]
+            if len(closes) >= sma_slow:
+                sma_fast_ = sum(closes[-sma_fast:]) / Decimal(str(sma_fast))
+                sma_slow_ = sum(closes) / Decimal(str(len(closes)))
+                in_pos = trader.state.open_position is not None
+                if not in_pos and sma_fast_ > sma_slow_:
+                    trader.buy(c.close, trader.state.balance_counter / c.close, at_ms=c.timestamp)
+                elif in_pos and (sma_fast_ < sma_slow_
+                                 or (sma_break_exit and c.close < sma_fast_)):
+                    reason = "trend_break" if sma_break_exit and c.close < sma_fast_ else "death_cross"
+                    trader.sell(c.close, trader.state.balance_base, reason=reason, at_ms=c.timestamp)
+        elif dc_entry:
+            # Donchian trend-following: long on N-bar breakout, exit on M-bar low.
+            # No profit cap -> winners run; channel exit IS the trailing stop.
+            in_pos = trader.state.open_position is not None
+            if not in_pos and i >= dc_entry and risk_status.trading_allowed:
+                channel_hi = max(c.high for c in candles[i - dc_entry:i])
+                if c.close > channel_hi:
+                    vol = trader.state.balance_counter * Decimal(str(dc_size)) / c.close
+                    if trader.buy(c.close, vol, at_ms=c.timestamp):
+                        trader.state.trades_today += 1
+            elif in_pos and i >= dc_exit:
+                channel_lo = min(c.low for c in candles[i - dc_exit:i])
+                if c.close < channel_lo:
+                    if trader.sell(c.close, trader.state.balance_base, reason="donchian_exit", at_ms=c.timestamp):
+                        trader.state.trades_today += 1
+        elif mean_rev:
+            # Fade RSI extremes: buy oversold, exit on recovery to mr_exit or
+            # mr_max_hours time-stop. Full balance per position, fees included.
+            rsi = compute_rsi([x.close for x in candles[max(0, i - 14):i + 1]], 14)
+            in_pos = trader.state.open_position is not None
+            if not in_pos and rsi is not None and rsi <= Decimal(str(mr_oversold)) and risk_status.trading_allowed:
+                if trader.buy(c.close, trader.state.balance_counter / c.close, at_ms=c.timestamp):
+                    trader.state.trades_today += 1
+                    mr_entry_i = i
+            elif in_pos and rsi is not None and (rsi >= Decimal(str(mr_exit)) or i - mr_entry_i >= mr_max_hours):
+                reason = "rsi_recovery" if rsi >= Decimal(str(mr_exit)) else "time_stop"
+                if trader.sell(c.close, trader.state.balance_base, reason=reason, at_ms=c.timestamp):
+                    trader.state.trades_today += 1
         elif risk_status.trading_allowed and signal is not None:
             if signal.action == "BUY" and trader.state.trades_today < gp.max_daily_trades:
                 if trend and (ctx.sma_long is None or c.close <= ctx.sma_long):
@@ -118,17 +185,18 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
                 else:
                     size_pct = risk.compute_position_size(trader.state.balance_counter, c.close, ctx.atr)
                     vol = trader.state.balance_counter * size_pct / c.close
-                    if trader.buy(c.close, vol):
+                    if trader.buy(c.close, vol, at_ms=c.timestamp,
+                                  reason=signal.family or signal.reason):
                         trader.state.trades_today += 1
             elif signal.action == "SELL" and trader.state.open_position is not None:
                 pos_vol = Decimal(trader.state.open_position["volume"])
-                if trader.sell(c.close, pos_vol * Decimal(str(gp.sell_fraction_pct)), reason=signal.reason):
+                if trader.sell(c.close, pos_vol * Decimal(str(gp.sell_fraction_pct)), reason=signal.reason, at_ms=c.timestamp):
                     trader.state.trades_today += 1
 
-        equity_curve.append(trader.portfolio_value)
+        equity_curve.append(trader.total_value(c.close))
         prev_portfolio_value = trader.portfolio_value
 
-    end = trader.portfolio_value
+    end = trader.total_value(candles[-1].close)
     bh_end = INITIAL * candles[-1].close / first_close
     years = (candles[-1].timestamp - candles[start_i].timestamp) / (365.25 * 24 * 3600 * 1000)
 
@@ -147,6 +215,12 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
         dd = (peak - e) / peak * 100
         max_dd = max(max_dd, dd)
 
+    hold_curve = [INITIAL * c.close / first_close for c in candles[start_i:]]
+    h_peak, h_max_dd = INITIAL, Decimal("0")
+    for e in hold_curve:
+        h_peak = max(h_peak, e)
+        h_max_dd = max(h_max_dd, (h_peak - e) / h_peak * 100)
+
     hold_return = (bh_end - INITIAL) / INITIAL * 100
     bot_return = (end - INITIAL) / INITIAL * 100
 
@@ -158,8 +232,10 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
     print(f"  Buy & hold: R{INITIAL:,.0f} -> R{bh_end:,.0f}  ({hold_return:+.2f}%, {cagr_pct(INITIAL, bh_end, years):+.2f}%/yr)")
     print(f"\n  Trades: {metrics.total_trades}  Win rate: {metrics.win_rate*100:.1f}%  "
           f"Profit factor: {metrics.profit_factor:.2f}")
-    print(f"  Max drawdown (equity): {max_dd:.1f}%  Sharpe: {metrics.sharpe_ratio:.2f}  "
-          f"Net BTC: {trader.state.balance_base:+.8f}")
+    print(f"  Max drawdown (equity): {max_dd:.1f}% (buy & hold: {h_max_dd:.1f}%)  "
+          f"Sharpe (trade-rate annualised, {metrics.total_trades} obs - not significant): {metrics.sharpe_ratio:.2f}  "
+          f"Net BTC: {trader.state.balance_base + trader.state.vault_base:+.8f}")
+    print(f"  Vault: {trader.state.vault_base:.8f} BTC (R{trader.state.vault_deposits:,.2f} swept)")
     print(f"  Fees: R{trader.state.total_fees:,.2f}")
     verdict = "BEATS buy-and-hold" if bot_return > hold_return else "LOSES to buy-and-hold"
     print(f"\nVERDICT: {verdict}")
@@ -171,6 +247,19 @@ def main() -> None:
     ap.add_argument("--days", type=int, default=0, help="only last N days (0 = all)")
     ap.add_argument("--dca", action="store_true", help="weekly fixed buys, no signals")
     ap.add_argument("--trend", action="store_true", help="only buy dips when price above long SMA")
+    ap.add_argument("--daily", action="store_true", help="resample hourly candles to daily bars")
+    ap.add_argument("--sma-regime", action="store_true", help="SMA regime: hold while golden cross")
+    ap.add_argument("--sma-fast", type=int, default=50, help="SMA regime fast period")
+    ap.add_argument("--sma-slow", type=int, default=200, help="SMA regime slow period")
+    ap.add_argument("--sma-break-exit", action="store_true",
+                    help="SMA regime: exit when close < fast SMA (not just death cross)")
+    ap.add_argument("--mean-rev", action="store_true", help="mean-reversion: buy RSI oversold, sell on recovery")
+    ap.add_argument("--mr-oversold", type=int, default=30, help="mean-rev RSI entry threshold")
+    ap.add_argument("--mr-exit", type=int, default=55, help="mean-rev RSI exit threshold")
+    ap.add_argument("--mr-max-hours", type=int, default=168, help="mean-rev time-stop hours")
+    ap.add_argument("--dc-entry", type=int, default=0, help="Donchian entry channel bars (0=off)")
+    ap.add_argument("--dc-exit", type=int, default=48, help="Donchian exit channel bars")
+    ap.add_argument("--dc-size", type=float, default=0.95, help="Donchian position size fraction")
     args = ap.parse_args()
 
     config = Config.from_env()
@@ -178,7 +267,14 @@ def main() -> None:
     if args.days:
         cutoff = (datetime.now(tz=timezone.utc).timestamp() - args.days * 86400) * 1000
         candles = [c for c in candles if c.timestamp >= cutoff]
-    run_backtest(candles, config, dca=args.dca, trend=args.trend)
+    if args.daily:
+        candles = resample_daily(candles)
+    run_backtest(candles, config, dca=args.dca, trend=args.trend,
+                 dc_entry=args.dc_entry, dc_exit=args.dc_exit, dc_size=args.dc_size,
+                 sma_regime=args.sma_regime, sma_fast=args.sma_fast, sma_slow=args.sma_slow,
+                 sma_break_exit=args.sma_break_exit, mean_rev=args.mean_rev,
+                 mr_oversold=args.mr_oversold, mr_exit=args.mr_exit,
+                 mr_max_hours=args.mr_max_hours)
 
 
 if __name__ == "__main__":
