@@ -504,6 +504,17 @@ completed_log = CompletedTradeLog.load(config.completed_trades_file or config.st
 gov_state = GovernanceState.load(config.governance_state_file)
 
 trader = PaperTrader(state, trade_log, completed_log, config.trading_pair)
+if trader.state.vault_deposits < 1:
+    from client import LunoClient
+    client = LunoClient(config.luno_api_base, config.luno_api_key_id, config.luno_api_secret)
+    try:
+        ticker = client.get_ticker(config.trading_pair)
+        client.close()
+        zar_amount = Decimal(str(config.initial_balance_counter)) * Decimal(str(config.initial_vault_pct))
+        btc = trader.initial_vault_allocation(zar_amount, ticker.last_trade)
+        logger.info("Initial vault allocation: R%.2f -> %.8f BTC at R%.2f", float(zar_amount), float(btc), float(ticker.last_trade))
+    except Exception as e:
+        logger.warning("Initial vault allocation failed: %s", e)
 strategy = Strategy(config, trader)
 risk_manager = RiskManager(
     max_daily_loss_pct=config.risk_max_daily_loss_pct,
@@ -540,6 +551,11 @@ async def main_loop() -> None:
         _start_key_reader()
 
     last_scan = 0.0
+    import signal
+    def _on_resize(signum, frame):
+        global _refresh
+        _refresh = True
+    signal.signal(signal.SIGWINCH, _on_resize)
     while True:
         due = _refresh or (time.time() - last_scan) >= config.scan_interval_seconds
         if due:
@@ -668,8 +684,10 @@ async def main_loop() -> None:
             if can_trade and signal.action == "BUY" and trader.state.trades_today < gp.max_daily_trades:
                 price = ticker.ask if ticker.ask else ticker.last_trade  # realistic fill: cross the spread
                 if config.strategy == "regime":
-                    # all-in, matches validated backtest shape (buy clamps to balance)
-                    order = trader.buy(price, trader.state.balance_counter / price,
+                    size_pct = risk_manager.compute_position_size(
+                        trader.state.balance_counter, price, ctx.atr
+                    )
+                    order = trader.buy(price, trader.state.balance_counter * size_pct / price,
                                        reason=signal.family or signal.reason)
                 else:
                     size_pct = risk_manager.compute_position_size(

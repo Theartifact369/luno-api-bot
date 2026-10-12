@@ -52,6 +52,7 @@ class Config:
     llm_model: str = "gpt-4"
 
     strategy: Literal["rules", "regime"] = "regime"
+    initial_vault_pct: float = 0.5
 
     kronos_url: str = ""
     kronos_horizon: int = 5
@@ -96,6 +97,7 @@ class Config:
         c.llm_api_key = os.getenv("LLM_API_KEY", c.llm_api_key)
         c.llm_model = os.getenv("LLM_MODEL", c.llm_model)
         c.strategy = os.getenv("STRATEGY", c.strategy)
+        c.initial_vault_pct = float(os.getenv("INITIAL_VAULT_PCT", str(c.initial_vault_pct)))
         c.kronos_url = os.getenv("KRONOS_URL", c.kronos_url)
         c.kronos_horizon = int(os.getenv("KRONOS_HORIZON", str(c.kronos_horizon)))
         c.kronos_refresh_seconds = int(os.getenv("KRONOS_REFRESH_SECONDS", str(c.kronos_refresh_seconds)))

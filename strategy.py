@@ -87,6 +87,30 @@ class Strategy:
             return 0.5, f"family '{family}' won under half ({len(same)} trades)"
         return 1.0, ""
 
+    def _order_book_check(self, price: Decimal) -> str:
+        """Order book imbalance: bid volume vs ask volume near price."""
+        try:
+            from client import LunoClient
+            client = LunoClient(self.config.luno_api_base, self.config.luno_api_key_id, self.config.luno_api_secret)
+            ob = client.get_order_book(self.trader.pair)
+            client.close()
+            bids = ob.get("bids", [])
+            asks = ob.get("asks", [])
+            if not bids or not asks:
+                return ""
+            bid_vol = sum(Decimal(b["volume"]) for b in bids[:10])
+            ask_vol = sum(Decimal(a["volume"]) for a in asks[:10])
+            if bid_vol == 0 or ask_vol == 0:
+                return ""
+            imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
+            if imbalance > Decimal("0.2"):
+                return f"OB: bid-heavy ({float(imbalance)*100:.0f}%)"
+            if imbalance < Decimal("-0.2"):
+                return f"OB: ask-heavy ({float(imbalance)*100:.0f}%)"
+            return ""
+        except Exception:
+            return ""
+
     def build_context(self, ticker: Ticker, candles: list[Candle]) -> MarketContext:
         closes = [c.close for c in candles]
         rsi = compute_rsi(closes, self.config.rsi_period)
@@ -148,7 +172,10 @@ class Strategy:
                 mult, fb = self._reason_feedback("golden_cross")
                 if mult == 0:
                     return Signal("HOLD", 0.0, f"Regime: golden cross skipped — {fb}", price)
+                ob_reason = self._order_book_check(price)
                 reason = "Regime: SMA50>200 golden — go all-in"
+                if ob_reason:
+                    reason += f" [{ob_reason}]"
                 return Signal("BUY", 0.7 * mult, reason + (f" [{fb}]" if fb else ""),
                               price, hard_exit=True, family="golden_cross")
             return Signal("HOLD", 0.0, "Regime: SMA50<200 — staying in cash", price)

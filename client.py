@@ -121,5 +121,10 @@ class LunoClient:
         resp.raise_for_status()
         return resp.json().get("tickers") or []
 
+    def get_order_book(self, pair: str) -> dict:
+        resp = self._client.get("/api/1/orderbook", params={"pair": pair})
+        resp.raise_for_status()
+        return resp.json()
+
     def close(self) -> None:
         self._client.close()

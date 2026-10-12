@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 .venv/
 candles_backtest.json
+candles/
 trading_state*.json
 governance_state.json
 *.bak-*

@@ -194,6 +194,10 @@ class PaperTrader:
         self.state.vault_deposits += amt
         return vol
 
+    def initial_vault_allocation(self, zar_amount: Decimal, price: Decimal) -> Decimal:
+        """One-time: sweep a fixed ZAR amount into vault BTC (buy-and-hold)."""
+        return self._sweep_profit_to_vault(zar_amount, price)
+
     def update_open_position_value(self, current_price: Decimal) -> None:
         if self.state.open_position is not None:
             vol = Decimal(self.state.open_position["volume"])
