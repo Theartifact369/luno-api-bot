@@ -1,4 +1,4 @@
-# luno-trader
+# crypto-backtest-harness
 
 A paper-trading research harness for Luno's ZAR markets, and an honest record
 of what was searched for and what was found.
