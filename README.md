@@ -3,6 +3,8 @@
 A paper-trading research harness for Luno's ZAR markets, and an honest record
 of what was searched for and what was found.
 
+![Live dashboard: market data, price and volume charts, trade history, and an open paper position](docs/dashboard.png)
+
 > ## ⚠️ The headline finding: no edge
 >
 > **No out-of-sample edge was found in SMA/EMA crossovers or Donchian
