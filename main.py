@@ -191,7 +191,7 @@ def _draw_frame() -> None:
     left_w, right_w = _split_widths(term.width)
     left = Panel(
         Text.from_ansi("\n".join(acct_visible)),
-        title=f"Luno Account (live) ({acct_label}, arrows)", title_align="left", height=box_h,
+        title=f"Trade History ({acct_label}, arrows)", title_align="left", height=box_h,
     )
     right = Panel(
         Text.from_ansi("\n".join(visible)),
@@ -401,9 +401,12 @@ def build_account_table(client: LunoClient, config: Config, tickers: list[dict])
         t.add_row("Status", Text(f"no trades on {config.trading_pair}", style="dim"))
         return t
     for tr in sorted(trades, key=lambda x: int(x["timestamp"]), reverse=True)[:12]:
-        when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(tr["timestamp"]) / 1000))
+        # date only, and 6dp volumes: the left panel is ~26 chars wide, so
+        # "2026-10-12 07:30 x 0.20000000" wraps to three lines.
+        when = time.strftime("%d %b %Y", time.gmtime(int(tr["timestamp"]) / 1000))
         side = "BUY" if tr.get("is_buy") else "SELL"
-        detail = f"{Decimal(str(tr['price'])):,.2f} x {Decimal(str(tr['volume'])):.8f}"
+        vol = Decimal(str(tr["volume"]))
+        detail = f"{Decimal(str(tr['price'])):,.0f} x {vol:.4f}"
         t.add_row(when, Text(side, style="green" if side == "BUY" else "red"), detail)
     return t
 
