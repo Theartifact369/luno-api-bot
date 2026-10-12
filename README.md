@@ -27,6 +27,45 @@ of what was searched for and what was found.
 > .venv/bin/python exposure.py              # held-vs-avoided bars
 > ```
 
+### Eight more families, also no edge
+
+Research continued past the crossovers. **8 families evaluated, none survived.**
+
+| Family | Result |
+|---|---|
+| Cross-sectional momentum (16 pairs) | 0/18 beat buy & hold *and* the basket |
+| Cross-sectional reversal | 0/18 |
+| Volatility-target sizing | 0/9 beat plain equal-weight |
+| Long-only RSI dip buying | dominated by buy & hold |
+| Calendar effects | real effect, **not predictive**, untradable |
+| Market-neutral pairs trading | **impossible** — spot-only venue |
+| Funding-rate / basis carry | **impossible** — no perpetuals on Luno |
+
+Two facts from [Luno's fee page](https://guide.luno.com/hc/en-gb/articles/14158595648541-Luno-fees-and-limits-in-South-Africa)
+bound all of it:
+
+- **Luno is spot-only.** No margin, no leverage, no shorting. Every
+  market-neutral construction — long one leg, short the other — cannot be
+  executed here at all.
+- **The crypto/ZAR taker fee is 0.60% at tier 1**, i.e. **1.30% per round
+  trip** and 14.4%/yr for monthly rebalancing. `research.py` originally
+  assumed 0.10% — six times too kind, so earlier results here were flattered.
+
+The one genuinely interesting finding: the **06:00 UTC** bar is 08:00 in
+South Africa, when the local cash market opens and RSA flow hits Luno. It
+replicated out of sample — best hour on train 2013–2021 (+0.1202%), still
+best on test 2021–2026 (+0.0586%, t=+4.36, surviving Bonferroni across 24
+buckets). It is still worthless: it does **not** predict
+(`corr(hour-6, next 24h) = +0.0224`; only volatility persists, not direction),
+and a 0.096%/hour effect is dwarfed by a 1.30% round trip.
+
+```
+.venv/bin/python crosspair.py        # cross-sectional, at real Luno fees
+.venv/bin/python calendar_oos.py     # the 06:00 UTC effect, train/test split
+.venv/bin/python calendar_predict.py # ...and why it still can't be traded
+.venv/bin/python test_cross_family_findings.py   # all of it, as a test
+```
+
 ---
 
 ## PAPER TRADING ONLY
@@ -53,6 +92,8 @@ committed — `.env` is gitignored and `.env.example` holds placeholders.
 ```bash
 .venv/bin/python test_research.py           # research-engine correctness
 .venv/bin/python test_edge_finding.py       # THE FINDING, as a test
+.venv/bin/python test_crosspair.py          # multi-asset portfolio accounting
+.venv/bin/python test_cross_family_findings.py  # 8 families, no edge
 .venv/bin/python test_backtest_harness.py   # backtest harness regressions
 .venv/bin/python test_backtest_honesty.py   # vault/verdict honesty guards
 .venv/bin/python test_papertrade.py         # fill, fee, cooldown logic
@@ -115,6 +156,10 @@ and the **same window** as the strategy, with spread and fees charged to both.
 | `research.py` | Causal research engine: signals, simulator, risk-adjusted metrics, walk-forward |
 | `stress.py` | Stress tests vs buy&hold / DCA / constant-fraction nulls |
 | `exposure.py` | Separates "edge" from "was flat more often" |
+| `crosspair.py` | Cross-sectional research across pairs, at Luno's real 0.60% fee |
+| `candidates.py` | Volatility targeting, calendar effects, dip buying |
+| `calendar_oos.py` | The 06:00 UTC effect, split train/test |
+| `calendar_predict.py` | Why that effect still can't be traded |
 | `kronos.py` | Optional external forecast client (off by default) |
 | `performance.py` | Trade-level metrics |
 | `candles/` | Cached OHLCV per pair+duration (gitignored) |
