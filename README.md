@@ -160,6 +160,7 @@ and the **same window** as the strategy, with spread and fees charged to both.
 | `candidates.py` | Volatility targeting, calendar effects, dip buying |
 | `calendar_oos.py` | The 06:00 UTC effect, split train/test |
 | `calendar_predict.py` | Why that effect still can't be traded |
+| `validate_engine.py` | Power curve, nulls, overfitting gap — measures the instrument |
 | `kronos.py` | Optional external forecast client (off by default) |
 | `performance.py` | Trade-level metrics |
 | `candles/` | Cached OHLCV per pair+duration (gitignored) |
@@ -185,3 +186,37 @@ inefficient or that no strategy can work. If a future candidate beats buy &
 hold on ≥60% of pairs out-of-sample **and** survives drawdown normalisation by
 time-in-market, `test_edge_finding.py` will fail — and that failure is the
 signal to re-evaluate, not a bug to silence.
+
+## How the negative result was validated
+
+Several bugs were found while building this (equity counted twice, fees
+charged as absolute amounts, a tautological t-stat). All of them were
+**inflating** — they made results too good, and announced themselves as absurd
+numbers. A bug that *suppresses* an edge produces a plausible mediocre curve
+and nobody notices, so "found no edge" is the claim most exposed to errors
+that were never caught.
+
+Rather than trust the code by inspection, the instrument itself was measured:
+
+| Check | Question | Result |
+|---|---|---|
+| **Power curve** | Can it find an edge that *is* there? | **Yes** — Sharpe +0.19 → +4.02 as planted signal rises |
+| **Null** | Does it invent money on zero-drift data? | **No** — −0.11 Sharpe (costs) |
+| **Timing null** | Does timing beat riding drift at random? | **No** — real +0.658 vs shuffled control +0.710 |
+| **Overfitting gap** | What is peeking at test worth? | **+0.64 Sharpe** — oracle +0.61, honest −0.03 |
+
+The overfitting row is the one worth reading twice: choosing the best spec
+*after* seeing the test segment makes 15 of 16 pairs beat buy & hold. Choosing
+it honestly, on train, makes 7 of 16 do — and the mean excess Sharpe goes from
++0.61 to **−0.03**. That gap is exactly the illusion the rest of this repo
+exists to remove.
+
+```
+.venv/bin/python validate_engine.py         # all four experiments
+.venv/bin/python test_engine_validation.py  # them, as assertions
+```
+
+**The calibrated claim is therefore: no edge was detectable above this
+harness's noise floor** — not the stronger "no edge exists." The power curve
+shows detection needs roughly `drift/vol ≥ 0.2`; an effect weaker than that is
+simply invisible here, in either direction.
