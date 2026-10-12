@@ -379,37 +379,32 @@ def build_ticker_bar(tickers: list[dict]) -> str:
 
 
 def build_account_table(client: LunoClient, config: Config, tickers: list[dict]) -> Table:
-    t = Table(title="Luno Account (live)", show_header=False)
-    t.add_column("Metric", style="cyan")
-    t.add_column("Value", style="yellow")
+    """Account activity, not holdings.
+
+    This panel used to print live balances and a ZAR total. A balance sheet
+    leaks the operator's real net worth into every screenshot, and that is not
+    what a trading log is for. Trade history shows what the account did.
+    """
+    t = Table(title="Trade History (live)", show_header=False)
+    t.add_column("When", style="cyan")
+    t.add_column("Side", style="magenta")
+    t.add_column("Detail", style="yellow")
     if not config.luno_api_key_id:
         t.add_row("Status", Text("no LUNO_API_KEY_ID in .env", style="red"))
         return t
     try:
-        balances = client.get_balances()
+        trades = client.get_account_trades(config.trading_pair)
     except Exception as e:
         t.add_row("Status", Text(f"API error: {str(e)[:80]}", style="red"))
         return t
-    # value each asset at its own ZAR pair price (e.g. ETH -> ETHZAR)
-    prices: dict[str, Decimal] = {"ZAR": Decimal("1")}
-    for tk in tickers:
-        if tk["pair"].endswith("ZAR"):
-            prices[tk["pair"][:-3]] = Decimal(tk["last_trade"])
-    total_zar = Decimal("0")
-    for b in balances:
-        bal = Decimal(b["balance"]) + Decimal(b.get("unconfirmed") or 0)
-        if bal == 0:
-            continue
-        asset = b["asset"]
-        bal_str = f"{bal:,.2f}" if asset == "ZAR" else f"{bal:.8f}".rstrip("0").rstrip(".")
-        price = prices.get(asset)
-        if price is None:
-            t.add_row(asset, bal_str)
-            continue
-        zar = bal * price
-        t.add_row(asset, f"{bal_str} (R{zar:,.2f})")
-        total_zar += zar
-    t.add_row("Total (ZAR)", f"R{total_zar:,.2f}")
+    if not trades:
+        t.add_row("Status", Text(f"no trades on {config.trading_pair}", style="dim"))
+        return t
+    for tr in sorted(trades, key=lambda x: int(x["timestamp"]), reverse=True)[:12]:
+        when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(tr["timestamp"]) / 1000))
+        side = "BUY" if tr.get("is_buy") else "SELL"
+        detail = f"{Decimal(str(tr['price'])):,.2f} x {Decimal(str(tr['volume'])):.8f}"
+        t.add_row(when, Text(side, style="green" if side == "BUY" else "red"), detail)
     return t
 
 
