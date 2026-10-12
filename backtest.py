@@ -17,17 +17,27 @@ from performance import compute_metrics
 from risk_manager import RiskManager
 from strategy import Strategy
 
-CACHE = Path("candles_backtest.json")
-START = datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000
+CACHE_DIR = Path("candles")
 WARMUP = 200
 INITIAL = Decimal("100000")
+# XBTZAR daily history on Luno starts 2013-04-13; 1h starts later. Requesting
+# from 2010 costs one extra request and the API just returns what it has.
+EARLIEST = datetime(2010, 1, 1, tzinfo=timezone.utc).timestamp() * 1000
 
 
-def fetch_candles(pair: str, duration: int, refresh: bool, config: Config) -> list[Candle]:
-    if CACHE.exists() and not refresh:
+def _cache_path(pair: str, duration: int) -> Path:
+    # keyed by pair+duration: a flat candles_backtest.json silently served
+    # XBTZAR 1h bars to a request for ETHZAR 1d bars
+    return CACHE_DIR / f"{pair}_{duration}.json"
+
+
+def fetch_candles(pair: str, duration: int, refresh: bool, config: Config,
+                  start_ms: int = int(EARLIEST)) -> list[Candle]:
+    cache = _cache_path(pair, duration)
+    if cache.exists() and not refresh:
         return [Candle(**{**c, "close": Decimal(c["close"]), "open": Decimal(c["open"]),
                           "high": Decimal(c["high"]), "low": Decimal(c["low"]), "volume": Decimal(c["volume"])})
-                for c in json.loads(CACHE.read_text())]
+                for c in json.loads(cache.read_text())]
 
     client = LunoClient(
         base_url=config.luno_api_base,
@@ -35,20 +45,28 @@ def fetch_candles(pair: str, duration: int, refresh: bool, config: Config) -> li
         api_key_secret=config.luno_api_secret,
     )
     seen: dict[int, Candle] = {}
-    since = int(START)
-    while since < datetime.now(tz=timezone.utc).timestamp() * 1000:
+    since = int(start_ms)
+    now = datetime.now(tz=timezone.utc).timestamp() * 1000
+    while since < now:
         chunk = client.get_candles(pair, duration, since)
         if not chunk:
             break
         for c in chunk:
             seen[c.timestamp] = c
-        since = max(c.timestamp for c in chunk) + duration * 1000
+        nxt = max(c.timestamp for c in chunk) + duration * 1000
+        # Luno caps a response at 1000 bars. If a page ever returns nothing
+        # newer than `since`, the old loop spun forever re-reading one page.
+        if nxt <= since:
+            print(f"\nno progress at {datetime.fromtimestamp(since/1000, tz=timezone.utc)}")
+            break
+        since = nxt
         print(f"fetched {len(seen)} candles...", end="\r", flush=True)
     client.close()
 
     candles = sorted(seen.values(), key=lambda c: c.timestamp)
-    CACHE.write_text(json.dumps([c.__dict__ for c in candles], default=str))
-    print(f"\n{len(candles)} candles cached to {CACHE}")
+    CACHE_DIR.mkdir(exist_ok=True)
+    cache.write_text(json.dumps([c.__dict__ for c in candles], default=str))
+    print(f"\n{len(candles)} candles cached to {cache}")
     return candles
 
 
@@ -78,7 +96,8 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
                  dc_entry: int = 0, dc_exit: int = 0, dc_size: float = 0.95,
                  sma_regime: bool = False, sma_fast: int = 50, sma_slow: int = 200,
                  sma_break_exit: bool = False, mean_rev: bool = False,
-                 mr_oversold: int = 30, mr_exit: int = 55, mr_max_hours: int = 168) -> None:
+                 mr_oversold: int = 30, mr_exit: int = 55, mr_max_hours: int = 168,
+                 sma_size: float = 1.0, spread_bps: float = 5.0) -> None:
     if len(candles) < WARMUP + 2:
         print("Not enough candle data")
         return
@@ -92,7 +111,15 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
     strategy = Strategy(config, trader)
     gp = GovernanceParams()
     strategy.update_governance(gp)
-    risk = RiskManager()
+    # was RiskManager() with all defaults, ignoring the configured limits --
+    # the backtest never tested the risk settings the bot actually runs
+    risk = RiskManager(
+        max_daily_loss_pct=config.risk_max_daily_loss_pct,
+        max_drawdown_pct=config.risk_max_drawdown_pct,
+        max_consecutive_losses=config.risk_max_consecutive_losses,
+        cooldown_hours=config.risk_cooldown_hours,
+        volatility_position_sizing=config.risk_volatility_sizing,
+    )
 
     start_i = WARMUP
     first_close = candles[start_i].close
@@ -109,7 +136,12 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
             trader.reset_daily_counter(day)
             risk.reset_daily(trader.total_value(c.close), day)
 
-        ticker = Ticker(pair=config.trading_pair, ask=c.close, bid=c.close,
+        # Crossing the spread costs money. Live XBTZAR bid/ask is ~0.005%, but
+        # ask==bid==close made every backtest fill free, flattering the edge.
+        # half = spread charged on the side you trade.
+        half = Decimal(str(spread_bps)) / Decimal("20000")
+        ticker = Ticker(pair=config.trading_pair, ask=c.close * (1 + half),
+                        bid=c.close * (1 - half),
                         last_trade=c.close, timestamp=c.timestamp, status="ACTIVE")
         ctx = strategy.build_context(ticker, candles[max(0, i - WARMUP):i + 1])
 
@@ -136,16 +168,23 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
             if (i - start_i) % (7 * 24) == 0 and trader.state.balance_counter >= budget:
                 trader.buy(c.close, budget / c.close, at_ms=c.timestamp)
         elif sma_regime:
-            # Regime filter: fully invested while SMA_fast > SMA_slow, cash on
-            # death cross. Optionally exit earlier when price breaks the fast
-            # line (--sma-break-exit) to cut crash drawdowns.
-            closes = [x.close for x in candles[max(0, i - sma_slow):i + 1]]
+            # Regime filter: invested while SMA_fast > SMA_slow, cash on
+            # death cross. ALL-IN / ALL-OUT -- volatility scaling here was
+            # capped at base_position_size_pct (30%), and with ATR/price >3%
+            # on 66% of daily bars it halved to 15%, so this deployed ~10% of
+            # capital while the docstring claimed "all-in". Sizing is a knob
+            # (--sma-size); the default now matches the strategy's intent.
+            closes = [x.close for x in candles[max(0, i - sma_slow + 1):i + 1]]
             if len(closes) >= sma_slow:
                 sma_fast_ = sum(closes[-sma_fast:]) / Decimal(str(sma_fast))
                 sma_slow_ = sum(closes) / Decimal(str(len(closes)))
                 in_pos = trader.state.open_position is not None
                 if not in_pos and sma_fast_ > sma_slow_:
-                    trader.buy(c.close, trader.state.balance_counter / c.close, at_ms=c.timestamp)
+                    if sma_size >= 1:
+                        vol = trader.state.balance_counter / c.close
+                    else:
+                        vol = trader.state.balance_counter * Decimal(str(sma_size)) / c.close
+                    trader.buy(c.close, vol, at_ms=c.timestamp, reason="golden_cross")
                 elif in_pos and (sma_fast_ < sma_slow_
                                  or (sma_break_exit and c.close < sma_fast_)):
                     reason = "trend_break" if sma_break_exit and c.close < sma_fast_ else "death_cross"
@@ -208,6 +247,12 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
         trader.state.consecutive_losses,
     )
 
+    # Strategy-only equity: the vault holds BTC forever, so total_value()
+    # folds "I was long BTC in 2014" into what looks like strategy alpha.
+    # Reported separately, never in the headline. See test_edge_finding.py.
+    strat_end = trader.portfolio_value
+    vault_end = trader.state.vault_base * candles[-1].close
+
     peak = INITIAL
     max_dd = Decimal("0")
     for e in equity_curve:
@@ -223,22 +268,45 @@ def run_backtest(candles: list[Candle], config: Config, dca: bool = False, trend
 
     hold_return = (bh_end - INITIAL) / INITIAL * 100
     bot_return = (end - INITIAL) / INITIAL * 100
+    strat_return = (strat_end - INITIAL) / INITIAL * 100
 
-    print("\n=========== BACKTEST: XBTZAR 1h, rules engine (governor+kronos off) ===========")
+    bar_h = (candles[1].timestamp - candles[0].timestamp) / 3600000 if len(candles) > 1 else 1
+    bar_name = f"{bar_h:g}h" if bar_h < 48 else f"{bar_h/24:g}d"
+    print(f"\n=========== BACKTEST: {config.trading_pair} {bar_name}, "
+          f"rules engine (governor+kronos off) ===========")
+    print(f"Spread: {spread_bps}bps per fill" + (f"  |  SMA size: {sma_size:.0%}" if sma_regime else ""))
     print(f"Period: {datetime.fromtimestamp(candles[start_i].timestamp / 1000, tz=timezone.utc).date()} "
           f"-> {datetime.fromtimestamp(candles[-1].timestamp / 1000, tz=timezone.utc).date()} ({years:.1f} yr)")
     print(f"Start price: R{first_close:,.0f}  End price: R{candles[-1].close:,.0f}")
-    print(f"\n  Bot:        R{INITIAL:,.0f} -> R{end:,.0f}  ({bot_return:+.2f}%, {cagr_pct(INITIAL, end, years):+.2f}%/yr)")
-    print(f"  Buy & hold: R{INITIAL:,.0f} -> R{bh_end:,.0f}  ({hold_return:+.2f}%, {cagr_pct(INITIAL, bh_end, years):+.2f}%/yr)")
+    print(f"\n  Strategy only:  R{INITIAL:,.0f} -> R{strat_end:,.0f}  "
+          f"({strat_return:+.2f}%, {cagr_pct(INITIAL, strat_end, years):+.2f}%/yr)  <- HEADLINE")
+    print(f"  + vault (BTC): R{vault_end:,.0f}  ({bot_return - strat_return:+.2f}% of the "
+          f"total, and that is just holding BTC since 2014)")
+    print(f"  Buy & hold:     R{INITIAL:,.0f} -> R{bh_end:,.0f}  "
+          f"({hold_return:+.2f}%, {cagr_pct(INITIAL, bh_end, years):+.2f}%/yr)")
     print(f"\n  Trades: {metrics.total_trades}  Win rate: {metrics.win_rate*100:.1f}%  "
           f"Profit factor: {metrics.profit_factor:.2f}")
-    print(f"  Max drawdown (equity): {max_dd:.1f}% (buy & hold: {h_max_dd:.1f}%)  "
-          f"Sharpe (trade-rate annualised, {metrics.total_trades} obs - not significant): {metrics.sharpe_ratio:.2f}  "
-          f"Net BTC: {trader.state.balance_base + trader.state.vault_base:+.8f}")
-    print(f"  Vault: {trader.state.vault_base:.8f} BTC (R{trader.state.vault_deposits:,.2f} swept)")
+    print(f"  Max drawdown (equity, incl. vault): {max_dd:.1f}% (buy & hold: {h_max_dd:.1f}%)")
     print(f"  Fees: R{trader.state.total_fees:,.2f}")
-    verdict = "BEATS buy-and-hold" if bot_return > hold_return else "LOSES to buy-and-hold"
+    print(f"  Vault: {trader.state.vault_base:.8f} BTC (R{trader.state.vault_deposits:,.2f} swept)")
+
+    # A verdict has to carry its own sample size and refuse to call a result
+    # significant when the trade count cannot support one. "BEATS buy-and-hold"
+    # on 12 trades is how the +74343% headline happened.
+    MIN_TRADES = 30
+    n = metrics.total_trades
+    beats = strat_return > hold_return
+    if n < MIN_TRADES:
+        verdict = ("NO VERDICT -- n=%d trades, below the %d needed to distinguish "
+                   "skill from luck" % (n, MIN_TRADES))
+    elif beats:
+        verdict = f"BEATS buy-and-hold on strategy return alone (n={n} trades)"
+    else:
+        verdict = f"LOSES to buy-and-hold (n={n} trades)"
     print(f"\nVERDICT: {verdict}")
+    print("NOTE: this is a single in-sample pass with parameters chosen by hand. "
+          "It is not evidence of an edge.")
+    print("      For the out-of-sample verdict see: .venv/bin/python research.py walk")
 
 
 def main() -> None:
@@ -253,6 +321,8 @@ def main() -> None:
     ap.add_argument("--sma-slow", type=int, default=200, help="SMA regime slow period")
     ap.add_argument("--sma-break-exit", action="store_true",
                     help="SMA regime: exit when close < fast SMA (not just death cross)")
+    ap.add_argument("--sma-size", type=float, default=1.0,
+                    help="fraction of cash to deploy per entry (1.0 = all-in, the strategy's intent)")
     ap.add_argument("--mean-rev", action="store_true", help="mean-reversion: buy RSI oversold, sell on recovery")
     ap.add_argument("--mr-oversold", type=int, default=30, help="mean-rev RSI entry threshold")
     ap.add_argument("--mr-exit", type=int, default=55, help="mean-rev RSI exit threshold")
@@ -260,10 +330,16 @@ def main() -> None:
     ap.add_argument("--dc-entry", type=int, default=0, help="Donchian entry channel bars (0=off)")
     ap.add_argument("--dc-exit", type=int, default=48, help="Donchian exit channel bars")
     ap.add_argument("--dc-size", type=float, default=0.95, help="Donchian position size fraction")
+    ap.add_argument("--spread-bps", type=float, default=5.0,
+                    help="half-spread charged per fill in bps (live XBTZAR ~0.5)")
+    ap.add_argument("--candles", type=int, default=0,
+                    help="fetch native candles of this duration in seconds (86400=daily). "
+                         "Default uses config.candle_duration.")
     args = ap.parse_args()
 
     config = Config.from_env()
-    candles = fetch_candles(config.trading_pair, config.candle_duration, args.refresh, config)
+    duration = args.candles or config.candle_duration
+    candles = fetch_candles(config.trading_pair, duration, args.refresh, config)
     if args.days:
         cutoff = (datetime.now(tz=timezone.utc).timestamp() - args.days * 86400) * 1000
         candles = [c for c in candles if c.timestamp >= cutoff]
@@ -274,7 +350,8 @@ def main() -> None:
                  sma_regime=args.sma_regime, sma_fast=args.sma_fast, sma_slow=args.sma_slow,
                  sma_break_exit=args.sma_break_exit, mean_rev=args.mean_rev,
                  mr_oversold=args.mr_oversold, mr_exit=args.mr_exit,
-                 mr_max_hours=args.mr_max_hours)
+                 mr_max_hours=args.mr_max_hours, sma_size=args.sma_size,
+                 spread_bps=args.spread_bps)
 
 
 if __name__ == "__main__":
